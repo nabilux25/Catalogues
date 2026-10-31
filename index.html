@@ -13,6 +13,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <style>
 :root{
   --paper:#F7F8FA; --card:#FFFFFF; --ink:#18202E; --muted:#5E6878; --line:#DCE1E8;
@@ -158,7 +159,7 @@ td.n input{width:78px}
 
     <div class="panel" id="importPanel">
       <h3>Importer un catalogue</h3>
-      <p class="small muted" style="margin-top:0">Choisis le PDF du catalogue : l’appli y cherche les produits de ta liste et relève le prix à côté. Tout se passe dans ton téléphone.</p>
+      <p class="small muted" style="margin-top:0">Choisis le catalogue, en PDF ou en images (photos, captures) : l’appli y cherche les produits de ta liste et relève le prix à côté. Tout se passe dans ton téléphone. Les images sont plus longues à lire (quelques secondes par page).</p>
       <div class="grid2">
         <div><label for="impStore">Magasin</label><select id="impStore"></select></div>
         <div class="grid2" style="gap:8px">
@@ -167,7 +168,7 @@ td.n input{width:78px}
         </div>
       </div>
       <div style="margin-top:10px">
-        <label class="btn alt pick" style="margin:0;width:100%">Choisir le PDF du catalogue<input id="impFiles" type="file" multiple accept="application/pdf,.pdf"></label>
+        <label class="btn alt pick" style="margin:0;width:100%">Choisir le catalogue (PDF ou images)<input id="impFiles" type="file" multiple accept="application/pdf,.pdf,image/*"></label>
         <div class="small muted" id="impPicked" style="margin-top:6px">Aucun catalogue choisi.</div>
         
       </div>
@@ -240,7 +241,7 @@ td.n input{width:78px}
       <p class="small muted" style="margin-top:0">Tes données restent dans ce téléphone. Fais une sauvegarde pour les garder ou les passer sur un autre appareil.</p>
       <div class="row">
         <button class="btn alt" id="backup" style="flex:1 1 140px">Sauvegarder</button>
-        <label class="btn alt pick" style="margin:0;flex:1 1 140px">Restaurer<input id="restore" type="file" accept="application/json,.json"></label>
+        <label class="btn alt pick" style="margin:0;flex:1 1 140px">Restaurer<input id="restore" type="file"></label>
       </div>
     </div>
   </section>
@@ -563,6 +564,13 @@ function scanPage(raw, items, diag){
         k += len - 1; break;
       }
     }
+    const a = raw[k], b = raw[k + 1];
+    if (a && b && /^\d{1,3}$/.test(a.s) && /^€?\d{2}€?$/.test(b.s) && b.h < a.h * 0.8 && b.x >= a.x
+        && b.x - (a.x + a.w) < a.h && Math.abs((b.y + b.h) - (a.y + a.h)) < a.h * 0.5
+        && !prices.some(p => p.x === a.x && p.y === a.y)) {
+      const v = parseFloat(a.s + "." + b.s.replace(/€/g, ""));
+      if (v >= 0.05 && v <= 500) { prices.push({ v, x: a.x, y: a.y, h: a.h, unit: false }); k++; }
+    }
   }
   // lignes de texte
   const sorted = raw.slice().sort((a, b) => b.y - a.y || a.x - b.x), lines = [];
@@ -601,6 +609,44 @@ function scanPage(raw, items, diag){
   });
   return out;
 }
+/* ---------- Lecture des images (OCR, dans le téléphone) ---------- */
+let ocrWorker = null;
+async function getOcr(){
+  if (!window.Tesseract) throw new Error("ocr");
+  if (!ocrWorker) {
+    setStatus(1, "Préparation de la lecture d’images… (la première fois, téléchargement de quelques Mo)");
+    ocrWorker = await Tesseract.createWorker("fra");
+  }
+  return ocrWorker;
+}
+function ocrWords(data){
+  if (Array.isArray(data.words) && data.words.length) return data.words;
+  const out = [];
+  (data.blocks || []).forEach(b => (b.paragraphs || []).forEach(p => (p.lines || []).forEach(l => (l.words || []).forEach(w => out.push(w)))));
+  return out;
+}
+async function ocrRaw(canvas){
+  const w = await getOcr();
+  const { data } = await w.recognize(canvas);
+  const H = canvas.height;
+  return ocrWords(data).filter(x => x.text && x.text.trim() && (x.confidence ?? 100) >= 30)
+    .map(x => ({ s: x.text.trim(), x: x.bbox.x0, y: H - x.bbox.y1, w: x.bbox.x1 - x.bbox.x0, h: (x.bbox.y1 - x.bbox.y0) || 8 }));
+}
+async function imageToCanvas(file){
+  const bmp = await createImageBitmap(file);
+  const sc = Math.min(2, 2400 / Math.max(bmp.width, bmp.height));
+  const c = document.createElement("canvas"); c.width = Math.round(bmp.width * sc); c.height = Math.round(bmp.height * sc);
+  c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+  return c;
+}
+async function imageScan(file, onPage){
+  const items = state.items.map(it => ({ it, t: norm(it.nom) })).filter(x => x.t.length);
+  onPage(1, 1, 0);
+  const c = await imageToCanvas(file);
+  const raw = await ocrRaw(c);
+  return { found: scanPage(raw, items, Math.hypot(c.width, c.height)), chars: raw.reduce((s, r) => s + r.s.length, 0) };
+}
+
 async function freeScan(file, onPage){
   const lib = window.pdfjsLib; if (!lib) throw new Error("pdf");
   const pdf = await lib.getDocument({ data: await file.arrayBuffer() }).promise;
@@ -611,44 +657,59 @@ async function freeScan(file, onPage){
     onPage(p, pdf.numPages, found.length);
     const page = await pdf.getPage(p), vp = page.getViewport({ scale: 1 });
     const tc = await page.getTextContent();
-    const raw = tc.items.filter(i => i.str && i.str.trim()).map(i => ({ s: i.str.trim(), x: i.transform[4], y: i.transform[5], w: i.width || 0, h: Math.abs(i.height || i.transform[3]) || 8 }));
+    let raw = tc.items.filter(i => i.str && i.str.trim()).map(i => ({ s: i.str.trim(), x: i.transform[4], y: i.transform[5], w: i.width || 0, h: Math.abs(i.height || i.transform[3]) || 8 }));
+    let diag = Math.hypot(vp.width, vp.height);
+    if (raw.reduce((s, r) => s + r.s.length, 0) < 40) {
+      // page en image : on la dessine puis on la lit
+      onPage(p, pdf.numPages, found.length, true);
+      const scale = Math.min(3, 2200 / vp.width), v2 = page.getViewport({ scale });
+      const c = document.createElement("canvas"); c.width = v2.width; c.height = v2.height;
+      await page.render({ canvasContext: c.getContext("2d"), viewport: v2 }).promise;
+      raw = await ocrRaw(c); diag = Math.hypot(c.width, c.height);
+    }
     chars += raw.reduce((s, r) => s + r.s.length, 0);
-    scanPage(raw, items, Math.hypot(vp.width, vp.height)).forEach(o => { o.page = p; found.push(o); });
+    scanPage(raw, items, diag).forEach(o => { o.page = p; found.push(o); });
   }
   return { found, chars, pages: pdf.numPages };
 }
 
 $("#impGo").onclick = async () => {
   const files = picked.slice();
-  if (!files.length) { alert("Choisis d’abord le PDF du catalogue."); return; }
+  if (!files.length) { alert("Choisis d’abord le catalogue (PDF ou images)."); return; }
   const store = $("#impStore").value, from = $("#impFrom").value || null, to = $("#impTo").value || null;
-  {
-    const pdfs = files.filter(f => f.type === "application/pdf" || /\.pdf$/i.test(f.name));
-    if (!pdfs.length) { setStatus(0, "L’appli lit uniquement les catalogues en PDF."); return; }
-    if (!state.items.length) { setStatus(0, "Ajoute d’abord des produits à ta liste : la recherche gratuite les cherche dans le catalogue."); return; }
-    $("#impGo").disabled = true; $("#impStop").hidden = false; ctl = new AbortController();
-    pending = []; $("#review").hidden = true;
-    let chars = 0;
-    try {
-      for (const f of pdfs) {
-        const r = await freeScan(f, (p, n, k) => setStatus(Math.round(p / n * 100), `Recherche page ${p}/${n} · ${pending.length + k} résultat${pending.length + k > 1 ? "s" : ""}`));
-        chars += r.chars;
-        const seen = new Set();
-        r.found.forEach(o => {
-          const key = o.pour + "|" + o.prix;
-          if (seen.has(key)) return; seen.add(key);
-          pending.push({ id: uid(), enseigne: store, nom: o.nom, marque: "", quantite: o.quantite, unite: o.unite, prix: o.prix,
-            prixEffectif: null, promo: o.promo, fidelite: false, debut: from, fin: to, source: "pdf", pour: o.pour, page: o.page, ok: true });
-        });
-      }
-      if (chars < 100) setStatus(100, "Ce PDF ne contient pas de texte lisible (catalogue scanné). Ce catalogue ne peut pas être lu automatiquement : saisis les offres à la main.");
-      else if (!pending.length) setStatus(100, "Aucun produit de ta liste trouvé dans ce catalogue. Essaie des noms plus simples (« café », « lait »).");
-      else setStatus(100, `${pending.length} résultat${pending.length > 1 ? "s" : ""} pour ta liste. Vérifie surtout les prix : décoche ce qui ne correspond pas.`);
-      renderReview();
-    } catch (e) {
-      setStatus(0, "Impossible de lire ce PDF.");
-    } finally { $("#impGo").disabled = false; $("#impStop").hidden = true; }
-  }
+  const isPdf = f => f.type === "application/pdf" || /\.pdf$/i.test(f.name);
+  const usable = files.filter(f => isPdf(f) || (f.type || "").startsWith("image/"));
+  if (!usable.length) { setStatus(0, "Choisis un catalogue en PDF ou en images."); return; }
+  if (!state.items.length) { setStatus(0, "Ajoute d’abord des produits à ta liste : l’appli les cherche dans le catalogue."); return; }
+  $("#impGo").disabled = true; $("#impStop").hidden = false; ctl = new AbortController();
+  pending = []; $("#review").hidden = true;
+  let chars = 0, failed = 0;
+  try {
+    for (let fi = 0; fi < usable.length; fi++) {
+      if (ctl.signal.aborted) break;
+      const f = usable[fi], label = usable.length > 1 ? `Fichier ${fi + 1}/${usable.length} · ` : "";
+      let r;
+      try {
+        r = isPdf(f)
+          ? await freeScan(f, (p, n, k, img) => setStatus(Math.round(p / n * 100), `${label}${img ? "Lecture de l’image, page" : "Recherche page"} ${p}/${n} · ${pending.length + k} résultat${pending.length + k > 1 ? "s" : ""}`))
+          : await imageScan(f, () => setStatus(Math.round(fi / usable.length * 100), `${label}Lecture de l’image… · ${pending.length} résultat${pending.length > 1 ? "s" : ""}`));
+      } catch (e) { failed++; continue; }
+      chars += r.chars;
+      const seen = new Set(pending.map(o => o.pour + "|" + o.prix));
+      r.found.forEach(o => {
+        const key = o.pour + "|" + o.prix;
+        if (seen.has(key)) return; seen.add(key);
+        pending.push({ id: uid(), enseigne: store, nom: o.nom, marque: "", quantite: o.quantite, unite: o.unite, prix: o.prix,
+          prixEffectif: null, promo: o.promo, fidelite: false, debut: from, fin: to, source: isPdf(f) ? "pdf" : "image",
+          pour: o.pour, page: isPdf(f) ? o.page : (usable.length > 1 ? fi + 1 : null), ok: true });
+      });
+    }
+    if (failed && failed === usable.length) setStatus(0, "Impossible de lire ce catalogue. Pour les images, la première lecture demande une connexion Internet.");
+    else if (chars < 40) setStatus(100, "Aucun texte lisible dans ce catalogue. Essaie une image plus nette ou zoomée.");
+    else if (!pending.length) setStatus(100, "Aucun produit de ta liste trouvé. Essaie des noms plus simples (« café », « lait »).");
+    else setStatus(100, `${pending.length} résultat${pending.length > 1 ? "s" : ""} pour ta liste. Vérifie surtout les prix : décoche ce qui ne correspond pas.`);
+    renderReview();
+  } finally { $("#impGo").disabled = false; $("#impStop").hidden = true; }
 };
 $("#impStop").onclick = () => ctl && ctl.abort();
 
